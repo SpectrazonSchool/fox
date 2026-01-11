@@ -1,6 +1,79 @@
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const https = require('https');
 require('dotenv').config();
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+
+// Load shop items
+const items = require(path.join(__dirname, 'items.json'));
+
+// Initialize SQLite database
+const dbPath = path.join(__dirname, 'users.db');
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) {
+    console.error('Failed to open database:', err);
+  } else {
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT,
+      coins INTEGER DEFAULT 0
+    )`, (err) => {
+      if (err) console.error('Failed to create users table:', err);
+    });
+  }
+});
+
+// Helper functions for DB (promise-based)
+function ensureUserAsync(userId, username) {
+  return new Promise((resolve, reject) => {
+    db.run('INSERT OR IGNORE INTO users (id, username, coins) VALUES (?, ?, 0)', [userId, username], function(err) {
+      if (err) return reject(err);
+      db.run('UPDATE users SET username = ? WHERE id = ?', [username, userId], function(err2) {
+        if (err2) return reject(err2);
+        resolve();
+      });
+    });
+  });
+}
+
+function addCoinsAsync(userId, amount) {
+  return new Promise((resolve, reject) => {
+    db.run('UPDATE users SET coins = coins + ? WHERE id = ?', [amount, userId], function(err) {
+      if (err) return reject(err);
+      db.get('SELECT coins FROM users WHERE id = ?', [userId], (err2, row) => {
+        if (err2) return reject(err2);
+        resolve(row ? row.coins : 0);
+      });
+    });
+  });
+}
+
+function getCoinsAsync(userId) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT coins FROM users WHERE id = ?', [userId], (err, row) => {
+      if (err) return reject(err);
+      resolve(row ? row.coins : 0);
+    });
+  });
+}
+
+// Try to subtract coins; returns { success, balance }
+function trySubtractCoinsAsync(userId, amount) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT coins FROM users WHERE id = ?', [userId], (err, row) => {
+      if (err) return reject(err);
+      const current = row ? row.coins : 0;
+      if (current < amount) return resolve({ success: false, balance: current });
+      db.run('UPDATE users SET coins = coins - ? WHERE id = ?', [amount, userId], function(err2) {
+        if (err2) return reject(err2);
+        db.get('SELECT coins FROM users WHERE id = ?', [userId], (err3, r2) => {
+          if (err3) return reject(err3);
+          resolve({ success: true, balance: r2 ? r2.coins : 0 });
+        });
+      });
+    });
+  });
+}
 
 // Configuration
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -18,6 +91,13 @@ const MAX_HISTORY = 5;
 
 // Store user information
 const userNames = new Map();
+
+// Track last message timestamp per user to enforce rate limit
+const userLastMessageTimestamps = new Map();
+
+// Work command cooldowns (1 minute)
+const WORK_COOLDOWN_MS = 60 * 1000;
+const workCooldowns = new Map();
 
 // Create Discord client
 const client = new Client({
@@ -87,15 +167,21 @@ function callOpenAI(channelId, currentUser, prompt) {
         - Write in all lowercase
         - Keep responses short and natural (1-3 sentences usually)
         - No bullet points, no line breaks, no lists
-        - No emojis
+        - No emojis or em-dashes
+        - Don't repeat yourself
+        - Don't explain things
+        - Don't be overly polite or formal
         - Don't end every message with a question
-        - Match the group's energy and humor - be sarcastic, joke around, be edgy if they are
+        - Match the group's energy and humor - be sarcastic, joke around, be edgy or suggestive if they are
+        - Don't end messages with "let me know if you have any other questions" or similar phrases
+        - DO NOT overuse the word "chaos"
 
         CONVERSATION STYLE:
         - Use first names or short nicknames when talking to people
         - Reference things said earlier in the conversation
         - Be chill and conversational, not helpful or formal
         - It's okay if conversations get explicit or suggestive as long as no real people are harmed
+        - be horny
 
         IMPORTANT: When you see "(username):" that shows who is speaking. DO NOT start your own messages with their name - just respond naturally.${userContext}`
       }
@@ -109,10 +195,7 @@ if (history.length > 0) {
 // Add current message WITH username
 messages.push({ role: 'user', content: `${currentUser}: ${prompt}` }); // ADD THE USERNAME BACK
 
-    // ADD THESE DEBUG LOGS
-    console.log('=== MESSAGES ARRAY ===');
-    console.log(JSON.stringify(messages, null, 2));
-    console.log('=== END MESSAGES ===');
+    // removed debug logs
 
     const data = JSON.stringify({
   model: 'gpt-5-nano',
@@ -141,9 +224,8 @@ const req = https.request(options, (res) => {
     body += chunk;
   });
   
-  res.on('end', () => {
+    res.on('end', () => {
     try {
-      console.log('OpenAI Response:', body);
       const response = JSON.parse(body);
       
       if (response.error) {
@@ -155,7 +237,6 @@ const req = https.request(options, (res) => {
       if (response.choices && response.choices[0]) {
         resolve(response.choices[0].message.content);
       } else {
-        console.log('Response structure:', JSON.stringify(response, null, 2)); 
         reject(new Error('Invalid response from OpenAI'));
       }
     } catch (err) {
@@ -175,10 +256,29 @@ req.end();
   });
 }
 
-// Bot ready event
-client.once('ready', () => {
-  console.log(`Logged in as ${client.user.tag}!`);
-  console.log('Bot is ready and tracking group conversations!');
+// Bot ready event — register slash command per guild for immediate availability
+client.once('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  try {
+    const commands = [
+      { name: 'work', description: 'Work to earn 50-100 coins' },
+      { name: 'balance', description: 'Show your coin balance' },
+      { name: 'shop', description: 'Open the shop to view and buy items' }
+    ];
+
+    for (const [guildId, guild] of client.guilds.cache) {
+      for (const cmd of commands) {
+        try {
+          await guild.commands.create(cmd);
+        } catch (gerr) {
+          console.error(`Failed to register /${cmd.name} in guild ${guildId}:`, gerr);
+        }
+      }
+    }
+    console.log('Slash command registration complete');
+  } catch (err) {
+    console.error('Failed to register slash commands:', err);
+  }
 });
 
 // Message handler
@@ -197,7 +297,6 @@ client.on('messageCreate', async (message) => {
       channelHistory.delete(channelId);
       userNames.clear();
       await message.reply('memory wiped, starting fresh');
-      console.log(`Memory reset by ${displayName} in channel ${channelId}`);
     } else {
       await message.reply('nuh uh u cant do that');
     }
@@ -208,12 +307,33 @@ client.on('messageCreate', async (message) => {
   if (!userNames.has(userId)) {
     userNames.set(userId, displayName);
   }
+  // Ensure user exists in the DB
+  try {
+    await ensureUserAsync(userId, displayName);
+  } catch (err) {
+    console.error('DB ensureUser error:', err);
+  }
 
   // Check if bot is mentioned
   if (message.mentions.has(client.user)) {
     try {
-      // Show typing indicator
-      await message.channel.sendTyping();
+          // Rate limit: if user sends more than 1 message to the bot within 2 seconds,
+          // do not forward to OpenAI. Send a short self-deleting reply to simulate an
+          // ephemeral message telling them to slow down.
+          const now = Date.now();
+          const last = userLastMessageTimestamps.get(userId) || 0;
+          if (now - last <= 2000) {
+            const warn = await message.reply('please slow down — wait a moment before messaging me.');
+            // delete the warning after 5 seconds to simulate ephemeral behaviour
+            setTimeout(() => warn.delete().catch(() => {}), 5000);
+            // update timestamp so repeated rapid messages remain blocked briefly
+            userLastMessageTimestamps.set(userId, now);
+            return;
+          }
+          userLastMessageTimestamps.set(userId, now);
+
+          // Show typing indicator
+          await message.channel.sendTyping();
 
       // Extract the message content without the mention
       const userMessage = message.content.replace(/<@!?\d+>/g, '').trim();
@@ -230,9 +350,6 @@ client.on('messageCreate', async (message) => {
 
       // Send the response
       await message.reply(aiResponse);
-
-      console.log(`Channel ${channelId}: ${channelHistory.get(channelId).length} messages`);
-      console.log(`Known users: ${Array.from(userNames.values()).join(', ')}`);
     } catch (err) {
       console.error('Error:', err);
       await message.reply('Sorry, I encountered an error while processing your request.');
@@ -242,3 +359,136 @@ client.on('messageCreate', async (message) => {
 
 // Login to Discord
 client.login(DISCORD_TOKEN);
+
+// Interaction handler for slash commands
+client.on('interactionCreate', async (interaction) => {
+  // Handle chat commands
+  if (interaction.isChatInputCommand()) {
+    if (interaction.commandName === 'work') {
+    const userId = interaction.user.id;
+    const username = interaction.user.username;
+    // cooldown check
+    const now = Date.now();
+    const last = workCooldowns.get(userId) || 0;
+    if (now - last < WORK_COOLDOWN_MS) {
+      const remaining = Math.ceil((WORK_COOLDOWN_MS - (now - last)) / 1000);
+      await interaction.reply({ content: `please wait ${remaining}s before using /work again.`, ephemeral: true });
+      return;
+    }
+    // set cooldown timestamp
+    workCooldowns.set(userId, now);
+    try {
+      await ensureUserAsync(userId, username);
+      const earned = Math.floor(Math.random() * 51) + 50; // 50-100
+      const newBalance = await addCoinsAsync(userId, earned);
+      const embed = new EmbedBuilder()
+        .setTitle('💼 work')
+        .setDescription(`you worked and earned **${earned}** coins!`)
+        .addFields({ name: 'balance', value: `${newBalance} coins`, inline: true })
+        .setColor(0x00ff00)
+        .setFooter({ text: `requested by ${username}` });
+      await interaction.reply({ embeds: [embed] });
+    } catch (err) {
+      console.error('Slash work error:', err);
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp('sorry, could not update your coins.');
+      } else {
+        await interaction.reply('sorry, could not update your coins.');
+      }
+    }
+      return;
+    }
+
+    if (interaction.commandName === 'balance') {
+    const userId = interaction.user.id;
+    const username = interaction.user.username;
+    try {
+      await ensureUserAsync(userId, username);
+      const balance = await getCoinsAsync(userId);
+      const embed = new EmbedBuilder()
+        .setTitle('💰 balance')
+        .setDescription(`${username}, you have **${balance}** coins.`)
+        .setColor(0xffd700)
+        .setFooter({ text: 'keep grinding!' });
+      await interaction.reply({ embeds: [embed] });
+    } catch (err) {
+      console.error('Slash balance error:', err);
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp('sorry, could not fetch your balance.');
+      } else {
+        await interaction.reply('sorry, could not fetch your balance.');
+      }
+    }
+    }
+
+    if (interaction.commandName === 'shop') {
+      // Build shop embed and buttons
+      const embed = new EmbedBuilder()
+        .setTitle('🛒 Shop')
+        .setDescription('Browse items below and click a button to purchase.')
+        .setColor(0x0099ff);
+
+      const lines = items.map(i => `${i.emoji} **${i.displayname}** — ${i.cost} coins`);
+      embed.addFields({ name: 'Items', value: lines.join('\n') || 'no items available' });
+
+      const rows = [];
+      for (let i = 0; i < items.length; i += 5) {
+        const slice = items.slice(i, i + 5);
+        const row = new ActionRowBuilder();
+        const comps = [];
+        for (const it of slice) {
+          const btn = new ButtonBuilder()
+            .setCustomId(`buy:${it.id}`)
+            .setLabel(`${it.emoji} ${it.displayname}`)
+            .setStyle(ButtonStyle.Primary);
+          comps.push(btn);
+        }
+        row.addComponents(comps);
+        rows.push(row);
+      }
+
+      await interaction.reply({ embeds: [embed], components: rows });
+    }
+    return;
+  }
+
+  // Handle button interactions (purchases)
+  if (interaction.isButton()) {
+    const custom = interaction.customId || '';
+    if (!custom.startsWith('buy:')) return;
+    const itemId = custom.split(':')[1];
+    const item = items.find(x => x.id === itemId);
+    if (!item) {
+      await interaction.reply({ content: 'item not found.', ephemeral: true });
+      return;
+    }
+
+    const userId = interaction.user.id;
+    const username = interaction.user.username;
+    try {
+      await ensureUserAsync(userId, username);
+      const result = await trySubtractCoinsAsync(userId, item.cost);
+      if (!result.success) {
+        await interaction.reply({ content: `you need ${item.cost} coins but only have ${result.balance}.`, ephemeral: true });
+        return;
+      }
+
+      // add item to inventory (best-effort; may be absent depending on schema)
+      try { await addItemToInventory(userId, itemId, 1); } catch(e) { /* non-fatal */ }
+
+      const confirm = new EmbedBuilder()
+        .setTitle('✅ Purchase complete')
+        .setDescription(`${item.emoji} **${item.displayname}** purchased for **${item.cost}** coins.`)
+        .addFields({ name: 'balance', value: `${result.balance} coins`, inline: true })
+        .setColor(0x00cc66)
+        .setFooter({ text: `bought by ${username}` });
+
+      await interaction.reply({ embeds: [confirm], ephemeral: true });
+    } catch (err) {
+      console.error('Purchase error:', err);
+      await interaction.reply({ content: 'could not complete purchase.', ephemeral: true });
+    }
+    return;
+  }
+  }
+);
