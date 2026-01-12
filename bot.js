@@ -4,10 +4,8 @@ require('dotenv').config();
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
-// Load shop items
 const items = require(path.join(__dirname, 'items.json'));
 
-// Initialize SQLite database
 const dbPath = path.join(__dirname, 'users.db');
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
@@ -20,10 +18,17 @@ const db = new sqlite3.Database(dbPath, (err) => {
     )`, (err) => {
       if (err) console.error('Failed to create users table:', err);
     });
+    db.run(`CREATE TABLE IF NOT EXISTS inventory (
+      user_id TEXT,
+      item_id TEXT,
+      qty INTEGER DEFAULT 0,
+      PRIMARY KEY(user_id, item_id)
+    )`, (err) => {
+      if (err) console.error('Failed to create inventory table:', err);
+    });
   }
 });
 
-// Helper functions for DB (promise-based)
 function ensureUserAsync(userId, username) {
   return new Promise((resolve, reject) => {
     db.run('INSERT OR IGNORE INTO users (id, username, coins) VALUES (?, ?, 0)', [userId, username], function(err) {
@@ -57,7 +62,6 @@ function getCoinsAsync(userId) {
   });
 }
 
-// Try to subtract coins; returns { success, balance }
 function trySubtractCoinsAsync(userId, amount) {
   return new Promise((resolve, reject) => {
     db.get('SELECT coins FROM users WHERE id = ?', [userId], (err, row) => {
@@ -75,31 +79,51 @@ function trySubtractCoinsAsync(userId, amount) {
   });
 }
 
-// Configuration
+function addItemToInventory(userId, itemId, qty = 1) {
+  return new Promise((resolve, reject) => {
+    db.run('INSERT INTO inventory (user_id, item_id, qty) VALUES (?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET qty = qty + excluded.qty', [userId, itemId, qty], function(err) {
+      if (err) return reject(err);
+      resolve();
+    });
+  });
+}
+
+function getItemQty(userId, itemId) {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT qty FROM inventory WHERE user_id = ? AND item_id = ?', [userId, itemId], (err, row) => {
+      if (err) return reject(err);
+      resolve(row ? row.qty : 0);
+    });
+  });
+}
+
+function getUserInventory(userId) {
+  return new Promise((resolve, reject) => {
+    db.all('SELECT item_id, qty FROM inventory WHERE user_id = ? AND qty > 0 ORDER BY item_id', [userId], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows || []);
+    });
+  });
+}
+
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Authorized users who can reset memory
 const AUTHORIZED_USERS = [
   '521989193745039390', 
   '847202305781792830'
 ];
 
-// Store conversation history per channel
 const channelHistory = new Map();
 const MAX_HISTORY = 5;
 
-// Store user information
 const userNames = new Map();
 
-// Track last message timestamp per user to enforce rate limit
 const userLastMessageTimestamps = new Map();
 
-// Work command cooldowns (1 minute)
 const WORK_COOLDOWN_MS = 60 * 1000;
 const workCooldowns = new Map();
 
-// Create Discord client
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -126,7 +150,6 @@ function getChannelHistory(channelId) {
   return channelHistory.get(channelId);
 }
 
-// Function to add message to channel history
 function addToHistory(channelId, username, content, isBot = false) {
   const history = getChannelHistory(channelId);
   const role = isBot ? 'assistant' : 'user';
@@ -134,13 +157,11 @@ function addToHistory(channelId, username, content, isBot = false) {
   
   history.push({ role, content: messageContent });
   
-  // Keep only the last MAX_HISTORY messages
   if (history.length > MAX_HISTORY) {
     channelHistory.set(channelId, history.slice(-MAX_HISTORY));
   }
 }
 
-// Function to build user context
 function buildUserContext() {
   const users = Array.from(userNames.values());
   if (users.length === 0) return '';
@@ -148,13 +169,11 @@ function buildUserContext() {
   return `\n\nUsers you know: ${users.join(', ')}. Remember their names and who said what.`;
 }
 
-// Function to call OpenAI API
 function callOpenAI(channelId, currentUser, prompt) {
   return new Promise((resolve, reject) => {
     const history = getChannelHistory(channelId);
     const userContext = buildUserContext();
     
-    // Build messages array - USE JSON.stringify instead of manual string building
     const messages = [
       { 
         role: 'system', 
@@ -187,15 +206,11 @@ function callOpenAI(channelId, currentUser, prompt) {
       }
     ];
 
-    // Add conversation history
 if (history.length > 0) {
   messages.push(...history);
 }
 
-// Add current message WITH username
-messages.push({ role: 'user', content: `${currentUser}: ${prompt}` }); // ADD THE USERNAME BACK
-
-    // removed debug logs
+messages.push({ role: 'user', content: `${currentUser}: ${prompt}` });
 
     const data = JSON.stringify({
   model: 'gpt-5-nano',
@@ -203,7 +218,7 @@ messages.push({ role: 'user', content: `${currentUser}: ${prompt}` }); // ADD TH
   max_completion_tokens: 5000
 });
 
-const dataBuffer = Buffer.from(data, 'utf8'); // Convert to buffer
+const dataBuffer = Buffer.from(data, 'utf8');
 
 const options = {
   hostname: 'api.openai.com',
@@ -213,7 +228,7 @@ const options = {
   headers: {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${OPENAI_API_KEY}`,
-    'Content-Length': dataBuffer.length // Use buffer length
+    'Content-Length': dataBuffer.length
   },
 };
 
@@ -251,19 +266,19 @@ req.on('error', (err) => {
   reject(err);
 });
 
-req.write(dataBuffer); // Write the buffer
+req.write(dataBuffer);
 req.end();
   });
 }
 
-// Bot ready event — register slash command per guild for immediate availability
 client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
     const commands = [
       { name: 'work', description: 'Work to earn 50-100 coins' },
       { name: 'balance', description: 'Show your coin balance' },
-      { name: 'shop', description: 'Open the shop to view and buy items' }
+      { name: 'shop', description: 'Open the shop to view and buy items' },
+      { name: 'inventory', description: 'View your inventory' }
     ];
 
     for (const [guildId, guild] of client.guilds.cache) {
@@ -281,9 +296,7 @@ client.once('clientReady', async () => {
   }
 });
 
-// Message handler
 client.on('messageCreate', async (message) => {
-  // Ignore messages from bots
   if (message.author.bot) return;
 
   const channelId = message.channel.id;
@@ -291,7 +304,6 @@ client.on('messageCreate', async (message) => {
   const username = message.author.username;
   const displayName = message.member?.displayName || username;
 
-    // Check for reset command
   if (message.content.trim() === '.reset') {
     if (AUTHORIZED_USERS.includes(userId)) {
       channelHistory.delete(channelId);
@@ -303,52 +315,38 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // Store user name
   if (!userNames.has(userId)) {
     userNames.set(userId, displayName);
   }
-  // Ensure user exists in the DB
   try {
     await ensureUserAsync(userId, displayName);
   } catch (err) {
     console.error('DB ensureUser error:', err);
   }
 
-  // Check if bot is mentioned
   if (message.mentions.has(client.user)) {
     try {
-          // Rate limit: if user sends more than 1 message to the bot within 2 seconds,
-          // do not forward to OpenAI. Send a short self-deleting reply to simulate an
-          // ephemeral message telling them to slow down.
           const now = Date.now();
           const last = userLastMessageTimestamps.get(userId) || 0;
           if (now - last <= 2000) {
             const warn = await message.reply('please slow down — wait a moment before messaging me.');
-            // delete the warning after 5 seconds to simulate ephemeral behaviour
             setTimeout(() => warn.delete().catch(() => {}), 5000);
-            // update timestamp so repeated rapid messages remain blocked briefly
             userLastMessageTimestamps.set(userId, now);
             return;
           }
           userLastMessageTimestamps.set(userId, now);
 
-          // Show typing indicator
           await message.channel.sendTyping();
 
-      // Extract the message content without the mention
       const userMessage = message.content.replace(/<@!?\d+>/g, '').trim();
       const prompt = userMessage || 'Hello!';
 
-      // Call OpenAI API with conversation history
       const aiResponse = await callOpenAI(channelId, displayName, prompt);
 
-      // Add user message to history AFTER successful API call
       addToHistory(channelId, displayName, prompt, false);
       
-      // Add AI response to channel history
       addToHistory(channelId, 'Bot', aiResponse, true);
 
-      // Send the response
       await message.reply(aiResponse);
     } catch (err) {
       console.error('Error:', err);
@@ -357,17 +355,13 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// Login to Discord
 client.login(DISCORD_TOKEN);
 
-// Interaction handler for slash commands
 client.on('interactionCreate', async (interaction) => {
-  // Handle chat commands
   if (interaction.isChatInputCommand()) {
     if (interaction.commandName === 'work') {
     const userId = interaction.user.id;
     const username = interaction.user.username;
-    // cooldown check
     const now = Date.now();
     const last = workCooldowns.get(userId) || 0;
     if (now - last < WORK_COOLDOWN_MS) {
@@ -375,11 +369,10 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.reply({ content: `please wait ${remaining}s before using /work again.`, ephemeral: true });
       return;
     }
-    // set cooldown timestamp
     workCooldowns.set(userId, now);
     try {
       await ensureUserAsync(userId, username);
-      const earned = Math.floor(Math.random() * 51) + 50; // 50-100
+      const earned = Math.floor(Math.random() * 51) + 50;
       const newBalance = await addCoinsAsync(userId, earned);
       const embed = new EmbedBuilder()
         .setTitle('💼 work')
@@ -422,7 +415,6 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'shop') {
-      // Build shop embed and buttons
       const embed = new EmbedBuilder()
         .setTitle('🛒 Shop')
         .setDescription('Browse items below and click a button to purchase.')
@@ -448,11 +440,39 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       await interaction.reply({ embeds: [embed], components: rows });
+      return;
+    }
+
+    if (interaction.commandName === 'inventory') {
+      const userId = interaction.user.id;
+      const username = interaction.user.username;
+      try {
+        await ensureUserAsync(userId, username);
+        const invRows = await getUserInventory(userId);
+        const embed = new EmbedBuilder()
+          .setTitle('📦 Inventory')
+          .setColor(0x9933ff);
+
+        if (invRows.length === 0) {
+          embed.setDescription('you don\'t own any items yet.');
+        } else {
+          const lines = invRows.map(row => {
+            const item = items.find(i => i.id === row.item_id);
+            if (!item) return `${row.item_id}: ${row.qty}`;
+            return `${item.emoji} **${item.displayname}** — ${row.qty}`;
+          });
+          embed.setDescription(lines.join('\n'));
+        }
+
+        await interaction.reply({ embeds: [embed], ephemeral: false });
+      } catch (err) {
+        console.error('Inventory error:', err);
+        await interaction.reply({ content: 'could not load your inventory.', ephemeral: true });
+      }
     }
     return;
   }
 
-  // Handle button interactions (purchases)
   if (interaction.isButton()) {
     const custom = interaction.customId || '';
     if (!custom.startsWith('buy:')) return;
@@ -473,8 +493,7 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // add item to inventory (best-effort; may be absent depending on schema)
-      try { await addItemToInventory(userId, itemId, 1); } catch(e) { /* non-fatal */ }
+      try { await addItemToInventory(userId, itemId, 1); } catch(e) { }
 
       const confirm = new EmbedBuilder()
         .setTitle('✅ Purchase complete')

@@ -1,2 +1,3 @@
 .env
 economy.db
+node_modules/
