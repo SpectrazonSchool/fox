@@ -1,10 +1,12 @@
 [
   {
-    "id": "itzarslefttesticle",
-    "emoji": "",
-    "displayname": "itzars left testicle",
+    "id": "commonchest",
+    "displayname": "Common Chest",
+    "aliases": ["chest", "common", "common chest"],
+    "emoji": "<:commonchest:1379990952088830066>",
     "cost": 10,
     "page": 1,
-    "function": "testicle"
+    "function": "chest",
+    "args": ["common"]
   }
 ]

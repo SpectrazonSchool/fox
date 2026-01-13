@@ -1,0 +1,25 @@
+{
+    "commonchest": {
+        "displayname": "Common Chest",
+        "items": [
+            {
+                "itemid": "item001",
+                "weight": 50,
+                "max_amt": 5,
+                "min_amt": 1
+            },
+            {
+                "itemid": "item002",
+                "weight": 30,
+                "max_amt": 3,
+                "min_amt": 1
+            },
+            {
+                "itemid": "item003",
+                "weight": 20,
+                "max_amt": 2,
+                "min_amt": 1
+            }
+        ]
+    }
+}

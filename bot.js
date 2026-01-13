@@ -1,109 +1,180 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const https = require('https');
 require('dotenv').config();
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const path = require('path');
 
 const items = require(path.join(__dirname, 'items.json'));
+const chests = require(path.join(__dirname, 'chests.json'));
 
-const dbPath = path.join(__dirname, 'users.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Failed to open database:', err);
-  } else {
-    db.run(`CREATE TABLE IF NOT EXISTS users (
+let db;
+
+const itemFunctions = {
+  chest: async ({ userId, item }) => {
+    const chestId = item.id;
+    const chestData = chests[chestId];
+    
+    if (!chestData) {
+      return { success: false, message: `chest data not found for ${item.displayname}` };
+    }
+    
+    const itemPool = chestData.items || [];
+    if (itemPool.length === 0) {
+      return { success: false, message: `${item.displayname} has no items to give` };
+    }
+    
+    const rewards = [];
+
+    for (const poolItem of itemPool) {
+      const rawWeight = typeof poolItem.weight === 'number' ? poolItem.weight : 0;
+      let chance = rawWeight;
+      if (chance > 1) chance = chance / 100;
+      if (chance < 0) chance = 0;
+      if (chance > 1) chance = 1;
+
+      if (Math.random() < chance) {
+        const minA = Number.isFinite(poolItem.min_amt) ? poolItem.min_amt : 1;
+        const maxA = Number.isFinite(poolItem.max_amt) ? poolItem.max_amt : minA;
+        const amt = Math.floor(Math.random() * (maxA - minA + 1)) + minA;
+        rewards.push({ itemid: poolItem.itemid, qty: amt });
+      }
+    }
+
+    // If nothing dropped, fallback to a single weighted pick so players always get something
+    if (rewards.length === 0) {
+      const totalWeight = itemPool.reduce((sum, i) => sum + (i.weight || 0), 0) || 1;
+      const r = Math.random() * totalWeight;
+      let acc = 0;
+      let pick = itemPool[0];
+      for (const p of itemPool) {
+        acc += (p.weight || 0);
+        if (r <= acc) { pick = p; break; }
+      }
+      const minA = Number.isFinite(pick.min_amt) ? pick.min_amt : 1;
+      const maxA = Number.isFinite(pick.max_amt) ? pick.max_amt : minA;
+      const amt = Math.floor(Math.random() * (maxA - minA + 1)) + minA;
+      rewards.push({ itemid: pick.itemid, qty: amt });
+    }
+
+    // Use transaction for safety
+    try {
+      db.exec('BEGIN TRANSACTION');
+      
+      for (const reward of rewards) {
+        try {
+          addItemToInventory(userId, reward.itemid, reward.qty);
+        } catch (e) {
+          console.error('Error adding chest drop to inventory:', e);
+          db.exec('ROLLBACK');
+          return { success: false, message: 'Failed to process chest drops' };
+        }
+      }
+      
+      db.exec('COMMIT');
+    } catch (e) {
+      console.error('Transaction error during chest open:', e);
+      try { db.exec('ROLLBACK'); } catch (e2) {}
+      return { success: false, message: 'Failed to process chest' };
+    }
+
+    const parts = rewards.map(rw => {
+      const meta = items.find(it => it.id === rw.itemid);
+      if (meta) return `${meta.emoji || ''} **${meta.displayname || rw.itemid}** x${rw.qty}`;
+      return `${rw.itemid} x${rw.qty}`;
+    });
+
+    return { success: true, message: `You opened ${item.displayname} and received: ${parts.join(', ')}` };
+  }
+};
+
+async function initializeDatabase() {
+  const dbPath = path.join(__dirname, 'users.db');
+  db = new Database(dbPath);
+  
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       username TEXT,
       coins INTEGER DEFAULT 0
-    )`, (err) => {
-      if (err) console.error('Failed to create users table:', err);
-    });
-    db.run(`CREATE TABLE IF NOT EXISTS inventory (
+    );
+    CREATE TABLE IF NOT EXISTS inventory (
       user_id TEXT,
       item_id TEXT,
       qty INTEGER DEFAULT 0,
       PRIMARY KEY(user_id, item_id)
-    )`, (err) => {
-      if (err) console.error('Failed to create inventory table:', err);
-    });
+    );
+    CREATE TABLE IF NOT EXISTS image_generations (
+      user_id TEXT,
+      timestamp INTEGER,
+      PRIMARY KEY(user_id, timestamp)
+    );
+  `);
+  
+  console.log('Database initialized');
+}
+
+// Wrapper functions for better-sqlite3
+const dbAsync = {
+  run: (sql, params = []) => {
+    const stmt = db.prepare(sql);
+    return stmt.run(...params);
+  },
+  get: (sql, params = []) => {
+    const stmt = db.prepare(sql);
+    return stmt.get(...params);
+  },
+  all: (sql, params = []) => {
+    const stmt = db.prepare(sql);
+    return stmt.all(...params);
   }
-});
+};
 
 function ensureUserAsync(userId, username) {
-  return new Promise((resolve, reject) => {
-    db.run('INSERT OR IGNORE INTO users (id, username, coins) VALUES (?, ?, 0)', [userId, username], function(err) {
-      if (err) return reject(err);
-      db.run('UPDATE users SET username = ? WHERE id = ?', [username, userId], function(err2) {
-        if (err2) return reject(err2);
-        resolve();
-      });
-    });
-  });
+  dbAsync.run('INSERT OR IGNORE INTO users (id, username, coins) VALUES (?, ?, 0)', [userId, username]);
+  dbAsync.run('UPDATE users SET username = ? WHERE id = ?', [username, userId]);
 }
 
 function addCoinsAsync(userId, amount) {
-  return new Promise((resolve, reject) => {
-    db.run('UPDATE users SET coins = coins + ? WHERE id = ?', [amount, userId], function(err) {
-      if (err) return reject(err);
-      db.get('SELECT coins FROM users WHERE id = ?', [userId], (err2, row) => {
-        if (err2) return reject(err2);
-        resolve(row ? row.coins : 0);
-      });
-    });
-  });
+  dbAsync.run('UPDATE users SET coins = coins + ? WHERE id = ?', [amount, userId]);
+  const row = dbAsync.get('SELECT coins FROM users WHERE id = ?', [userId]);
+  return row ? row.coins : 0;
 }
 
 function getCoinsAsync(userId) {
-  return new Promise((resolve, reject) => {
-    db.get('SELECT coins FROM users WHERE id = ?', [userId], (err, row) => {
-      if (err) return reject(err);
-      resolve(row ? row.coins : 0);
-    });
-  });
+  const row = dbAsync.get('SELECT coins FROM users WHERE id = ?', [userId]);
+  return row ? row.coins : 0;
 }
 
 function trySubtractCoinsAsync(userId, amount) {
-  return new Promise((resolve, reject) => {
-    db.get('SELECT coins FROM users WHERE id = ?', [userId], (err, row) => {
-      if (err) return reject(err);
-      const current = row ? row.coins : 0;
-      if (current < amount) return resolve({ success: false, balance: current });
-      db.run('UPDATE users SET coins = coins - ? WHERE id = ?', [amount, userId], function(err2) {
-        if (err2) return reject(err2);
-        db.get('SELECT coins FROM users WHERE id = ?', [userId], (err3, r2) => {
-          if (err3) return reject(err3);
-          resolve({ success: true, balance: r2 ? r2.coins : 0 });
-        });
-      });
-    });
-  });
+  const row = dbAsync.get('SELECT coins FROM users WHERE id = ?', [userId]);
+  const current = row ? row.coins : 0;
+  if (current < amount) return { success: false, balance: current };
+  
+  dbAsync.run('UPDATE users SET coins = coins - ? WHERE id = ?', [amount, userId]);
+  const updatedRow = dbAsync.get('SELECT coins FROM users WHERE id = ?', [userId]);
+  return { success: true, balance: updatedRow ? updatedRow.coins : 0 };
 }
 
 function addItemToInventory(userId, itemId, qty = 1) {
-  return new Promise((resolve, reject) => {
-    db.run('INSERT INTO inventory (user_id, item_id, qty) VALUES (?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET qty = qty + excluded.qty', [userId, itemId, qty], function(err) {
-      if (err) return reject(err);
-      resolve();
-    });
-  });
+  dbAsync.run(
+    'INSERT INTO inventory (user_id, item_id, qty) VALUES (?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET qty = qty + excluded.qty',
+    [userId, itemId, qty]
+  );
 }
 
 function getItemQty(userId, itemId) {
-  return new Promise((resolve, reject) => {
-    db.get('SELECT qty FROM inventory WHERE user_id = ? AND item_id = ?', [userId, itemId], (err, row) => {
-      if (err) return reject(err);
-      resolve(row ? row.qty : 0);
-    });
-  });
+  const row = dbAsync.get('SELECT qty FROM inventory WHERE user_id = ? AND item_id = ?', [userId, itemId]);
+  return row ? row.qty : 0;
 }
 
 function getUserInventory(userId) {
-  return new Promise((resolve, reject) => {
-    db.all('SELECT item_id, qty FROM inventory WHERE user_id = ? AND qty > 0 ORDER BY item_id', [userId], (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows || []);
-    });
-  });
+  const rows = dbAsync.all('SELECT item_id, qty FROM inventory WHERE user_id = ? AND qty > 0 ORDER BY item_id', [userId]);
+  return rows || [];
+}
+
+function removeItemFromInventory(userId, itemId, qty = 1) {
+  dbAsync.run('UPDATE inventory SET qty = qty - ? WHERE user_id = ? AND item_id = ? AND qty >= ?', [qty, userId, itemId, qty]);
+  dbAsync.run('DELETE FROM inventory WHERE user_id = ? AND item_id = ? AND qty <= 0', [userId, itemId]);
 }
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -124,6 +195,8 @@ const userLastMessageTimestamps = new Map();
 const WORK_COOLDOWN_MS = 60 * 1000;
 const workCooldowns = new Map();
 
+const IMAGE_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -140,6 +213,69 @@ function escapeJsonString(str) {
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '\\r')
     .replace(/\t/g, '\\t');
+}
+
+// Helper function to build shop display
+function buildShopDisplay(page) {
+  const itemsByPage = {};
+  items.forEach(item => {
+    const pageNum = item.page || 1;
+    if (!itemsByPage[pageNum]) itemsByPage[pageNum] = [];
+    itemsByPage[pageNum].push(item);
+  });
+
+  const pages = Object.keys(itemsByPage).map(Number).sort((a, b) => a - b);
+  const maxPage = pages.length > 0 ? Math.max(...pages) : 1;
+  const validPage = Math.max(1, Math.min(page, maxPage));
+  const pageItems = itemsByPage[validPage] || [];
+
+  const embed = new EmbedBuilder()
+    .setTitle('🛒 Shop')
+    .setDescription(`Page ${validPage} of ${maxPage}`)
+    .setColor(0x0099ff);
+
+  const lines = pageItems.map(i => `${i.emoji} **${i.displayname}** — ${i.cost} coins`);
+  embed.addFields({ name: 'Items', value: lines.join('\n') || 'no items on this page' });
+
+  const rows = [];
+  const buyRow = new ActionRowBuilder();
+  const comps = [];
+  
+  for (const it of pageItems) {
+    const btn = new ButtonBuilder()
+      .setCustomId(`buy:${it.id}`)
+      .setLabel(`${it.emoji} ${it.displayname}`)
+      .setStyle(ButtonStyle.Primary);
+    comps.push(btn);
+  }
+  
+  if (comps.length > 0) {
+    buyRow.addComponents(comps);
+    rows.push(buyRow);
+  }
+
+  const navRow = new ActionRowBuilder();
+  if (validPage > 1) {
+    navRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`shop_prev:${validPage - 1}`)
+        .setLabel('⬅ Previous')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (validPage < maxPage) {
+    navRow.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`shop_next:${validPage + 1}`)
+        .setLabel('Next ➡')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+  if (navRow.components.length > 0) {
+    rows.push(navRow);
+  }
+
+  return { embeds: [embed], components: rows };
 }
 
 // Function to get or create conversation history for a channel
@@ -169,6 +305,116 @@ function buildUserContext() {
   return `\n\nUsers you know: ${users.join(', ')}. Remember their names and who said what.`;
 }
 
+function checkImageGenerationCooldown(userId) {
+  // If authorized user, always allow
+  if (AUTHORIZED_USERS.includes(userId)) {
+    return { allowed: true, timeRemaining: 0 };
+  }
+  
+  const now = Date.now();
+  const thirtyMinutesAgo = now - IMAGE_COOLDOWN_MS;
+  
+  // Get image generations from the last 30 minutes
+  const recentGenerations = dbAsync.all(
+    'SELECT timestamp FROM image_generations WHERE user_id = ? AND timestamp > ?',
+    [userId, thirtyMinutesAgo]
+  );
+  
+  const count = recentGenerations.length;
+  
+  // If user has 2 or more generations, check time until next one is available
+  if (count >= 2) {
+    const oldestGeneration = recentGenerations[0].timestamp;
+    const timeRemaining = Math.ceil((oldestGeneration + IMAGE_COOLDOWN_MS - now) / 1000);
+    return { allowed: false, timeRemaining };
+  }
+  
+  return { allowed: true, timeRemaining: 0 };
+}
+
+function recordImageGeneration(userId) {
+  const now = Date.now();
+  dbAsync.run(
+    'INSERT INTO image_generations (user_id, timestamp) VALUES (?, ?)',
+    [userId, now]
+  );
+}
+
+function formatTimeRemaining(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  
+  if (minutes === 0) {
+    return `${remainingSeconds}s`;
+  } else if (minutes === 1) {
+    return `1m ${remainingSeconds}s`;
+  } else {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+}
+
+function generateImage(description) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({
+      model: 'dall-e-3',
+      prompt: description,
+      n: 1,
+      size: '1024x1024'
+    });
+
+    const dataBuffer = Buffer.from(data, 'utf8');
+
+    const options = {
+      hostname: 'api.openai.com',
+      port: 443,
+      path: '/v1/images/generations',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Length': dataBuffer.length
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let body = '';
+
+      res.on('data', (chunk) => {
+        body += chunk;
+      });
+      
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(body);
+          
+          if (response.error) {
+            console.error('OpenAI Image API Error:', response.error);
+            reject(new Error(`Image generation failed: ${response.error.message}`));
+            return;
+          }
+          
+          if (response.data && response.data[0] && response.data[0].url) {
+            resolve(response.data[0].url);
+          } else {
+            reject(new Error('Invalid response from image API'));
+          }
+        } catch (err) {
+          console.error('Parse error:', err);
+          console.error('Raw body:', body);
+          reject(err);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.write(dataBuffer);
+    req.end();
+  });
+}
+
 function callOpenAI(channelId, currentUser, prompt) {
   return new Promise((resolve, reject) => {
     const history = getChannelHistory(channelId);
@@ -194,6 +440,10 @@ function callOpenAI(channelId, currentUser, prompt) {
         - Match the group's energy and humor - be sarcastic, joke around, be edgy or suggestive if they are
         - Don't end messages with "let me know if you have any other questions" or similar phrases
         - DO NOT overuse the word "chaos"
+
+        IMAGE GENERATION:
+        - You can generate images by responding with: IMAGE_GENERATION: [detailed description of the image]
+        - Only generate images when asked or when it makes sense in conversation
 
         CONVERSATION STYLE:
         - Use first names or short nicknames when talking to people
@@ -271,14 +521,27 @@ req.end();
   });
 }
 
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  
+  // Initialize database
+  try {
+    await initializeDatabase();
+  } catch (err) {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  }
+  
   try {
     const commands = [
-      { name: 'work', description: 'Work to earn 50-100 coins' },
-      { name: 'balance', description: 'Show your coin balance' },
-      { name: 'shop', description: 'Open the shop to view and buy items' },
-      { name: 'inventory', description: 'View your inventory' }
+        { name: 'work', description: 'Work to earn 50-100 coins' },
+        { name: 'balance', description: 'Show your coin balance' },
+        { name: 'shop', description: 'Open the shop to view and buy items' },
+        { name: 'inventory', description: 'View your inventory' },
+        { name: 'use', description: 'Use an item from your inventory', options: [
+          { name: 'item_id', description: 'ID of the item to use', type: 3, required: true },
+          { name: 'quantity', description: 'How many of the item to use', type: 4, required: false }
+        ] }
     ];
 
     for (const [guildId, guild] of client.guilds.cache) {
@@ -319,7 +582,7 @@ client.on('messageCreate', async (message) => {
     userNames.set(userId, displayName);
   }
   try {
-    await ensureUserAsync(userId, displayName);
+    ensureUserAsync(userId, displayName);
   } catch (err) {
     console.error('DB ensureUser error:', err);
   }
@@ -345,9 +608,40 @@ client.on('messageCreate', async (message) => {
 
       addToHistory(channelId, displayName, prompt, false);
       
-      addToHistory(channelId, 'Bot', aiResponse, true);
-
-      await message.reply(aiResponse);
+      // Check if response contains image generation request
+      if (aiResponse.includes('IMAGE_GENERATION:')) {
+        const imageMatch = aiResponse.match(/IMAGE_GENERATION:\s*(.+)/);
+        if (imageMatch) {
+          const imageDescription = imageMatch[1].trim();
+          
+          // Check cooldown first
+          const cooldownCheck = checkImageGenerationCooldown(userId);
+          if (!cooldownCheck.allowed) {
+            const timeStr = formatTimeRemaining(cooldownCheck.timeRemaining);
+            const limitMessage = `-# It seems like you tried to generate an image, but you've reached your limit of 2 images/30m! try again in ${timeStr}`;
+            addToHistory(channelId, 'Bot', limitMessage, true);
+            await message.reply(limitMessage);
+            return;
+          }
+          
+          // Generate image
+          try {
+            const imageUrl = await generateImage(imageDescription);
+            // Record this generation in database
+            recordImageGeneration(userId);
+            addToHistory(channelId, 'Bot', `[Generated image: ${imageDescription}]`, true);
+            await message.reply({ content: `here:`, files: [imageUrl] });
+          } catch (imageErr) {
+            console.error('Image generation error:', imageErr);
+            const errorResponse = 'couldn\'t generate that one';
+            addToHistory(channelId, 'Bot', errorResponse, true);
+            await message.reply(errorResponse);
+          }
+        }
+      } else {
+        addToHistory(channelId, 'Bot', aiResponse, true);
+        await message.reply(aiResponse);
+      }
     } catch (err) {
       console.error('Error:', err);
       await message.reply('Sorry, I encountered an error while processing your request.');
@@ -371,9 +665,9 @@ client.on('interactionCreate', async (interaction) => {
     }
     workCooldowns.set(userId, now);
     try {
-      await ensureUserAsync(userId, username);
+      ensureUserAsync(userId, username);
       const earned = Math.floor(Math.random() * 51) + 50;
-      const newBalance = await addCoinsAsync(userId, earned);
+      const newBalance = addCoinsAsync(userId, earned);
       const embed = new EmbedBuilder()
         .setTitle('💼 work')
         .setDescription(`you worked and earned **${earned}** coins!`)
@@ -396,8 +690,8 @@ client.on('interactionCreate', async (interaction) => {
     const userId = interaction.user.id;
     const username = interaction.user.username;
     try {
-      await ensureUserAsync(userId, username);
-      const balance = await getCoinsAsync(userId);
+      ensureUserAsync(userId, username);
+      const balance = getCoinsAsync(userId);
       const embed = new EmbedBuilder()
         .setTitle('💰 balance')
         .setDescription(`${username}, you have **${balance}** coins.`)
@@ -415,31 +709,8 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.commandName === 'shop') {
-      const embed = new EmbedBuilder()
-        .setTitle('🛒 Shop')
-        .setDescription('Browse items below and click a button to purchase.')
-        .setColor(0x0099ff);
-
-      const lines = items.map(i => `${i.emoji} **${i.displayname}** — ${i.cost} coins`);
-      embed.addFields({ name: 'Items', value: lines.join('\n') || 'no items available' });
-
-      const rows = [];
-      for (let i = 0; i < items.length; i += 5) {
-        const slice = items.slice(i, i + 5);
-        const row = new ActionRowBuilder();
-        const comps = [];
-        for (const it of slice) {
-          const btn = new ButtonBuilder()
-            .setCustomId(`buy:${it.id}`)
-            .setLabel(`${it.emoji} ${it.displayname}`)
-            .setStyle(ButtonStyle.Primary);
-          comps.push(btn);
-        }
-        row.addComponents(comps);
-        rows.push(row);
-      }
-
-      await interaction.reply({ embeds: [embed], components: rows });
+      const currentPage = interaction.options.getInteger('page') || 1;
+      await interaction.reply(buildShopDisplay(currentPage));
       return;
     }
 
@@ -447,8 +718,8 @@ client.on('interactionCreate', async (interaction) => {
       const userId = interaction.user.id;
       const username = interaction.user.username;
       try {
-        await ensureUserAsync(userId, username);
-        const invRows = await getUserInventory(userId);
+        ensureUserAsync(userId, username);
+        const invRows = getUserInventory(userId);
         const embed = new EmbedBuilder()
           .setTitle('📦 Inventory')
           .setColor(0x9933ff);
@@ -470,11 +741,84 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({ content: 'could not load your inventory.', ephemeral: true });
       }
     }
+
+    if (interaction.commandName === 'use') {
+      const itemId = interaction.options.getString('item_id');
+      const userId = interaction.user.id;
+      const username = interaction.user.username;
+      const requestedQty = interaction.options.getInteger('quantity') || 1;
+
+      const useQty = Math.max(1, Math.min(requestedQty, 25));
+
+      if (!itemId) {
+        await interaction.reply({ content: 'please provide an item id to use.', ephemeral: true });
+        return;
+      }
+
+      let item = items.find(x => x.id === itemId);
+      if (!item) {
+        item = items.find(x => x.aliases && x.aliases.includes(itemId.toLowerCase()));
+      }
+
+      if (!item) {
+        await interaction.reply({ content: `item '${itemId}' not found.`, ephemeral: true });
+        return;
+      }
+
+      try {
+        ensureUserAsync(userId, username);
+        const owned = getItemQty(userId, item.id);
+        if (owned <= 0) {
+          await interaction.reply({ content: `you don't own any ${item.displayname}.`, ephemeral: true });
+          return;
+        }
+
+        if (owned < useQty) {
+          await interaction.reply({ content: `you only have ${owned}x ${item.displayname}, cannot use ${useQty}.`, ephemeral: true });
+          return;
+        }
+
+        const funcName = item.function;
+        if (!funcName || !itemFunctions[funcName]) {
+          await interaction.reply({ content: `${item.displayname} has no function assigned or it is not implemented.`, ephemeral: true });
+          return;
+        }
+
+        const results = [];
+        for (let i = 0; i < useQty; i++) {
+          const res = await itemFunctions[funcName]({ userId, item });
+          if (!res || !res.success) {
+            await interaction.reply({ content: res?.message || `could not use ${item.displayname}.`, ephemeral: true });
+            return;
+          }
+          results.push(res);
+        }
+
+        removeItemFromInventory(userId, item.id, useQty);
+
+        const combined = results.map(r => r.message || '').filter(Boolean).join(' | ');
+        await interaction.reply({ content: `${item.emoji} ${combined || `used ${useQty}x ${item.displayname}`}`, ephemeral: true });
+      } catch (err) {
+        console.error('Use command error:', err);
+        await interaction.reply({ content: 'error while using item.', ephemeral: true });
+      }
+      return;
+    }
     return;
   }
 
   if (interaction.isButton()) {
     const custom = interaction.customId || '';
+    
+    if (custom.startsWith('shop_next:') || custom.startsWith('shop_prev:')) {
+      const parts = custom.split(':');
+      const nextPage = parseInt(parts[1]);
+      if (!isNaN(nextPage)) {
+        await interaction.update(buildShopDisplay(nextPage));
+        return;
+      }
+    }
+
     if (!custom.startsWith('buy:')) return;
     const itemId = custom.split(':')[1];
     const item = items.find(x => x.id === itemId);
@@ -486,23 +830,35 @@ client.on('interactionCreate', async (interaction) => {
     const userId = interaction.user.id;
     const username = interaction.user.username;
     try {
-      await ensureUserAsync(userId, username);
-      const result = await trySubtractCoinsAsync(userId, item.cost);
-      if (!result.success) {
-        await interaction.reply({ content: `you need ${item.cost} coins but only have ${result.balance}.`, ephemeral: true });
-        return;
+      ensureUserAsync(userId, username);
+      
+      // Use transaction for purchase safety
+      try {
+        db.exec('BEGIN TRANSACTION');
+        
+        const result = trySubtractCoinsAsync(userId, item.cost);
+        if (!result.success) {
+          db.exec('ROLLBACK');
+          await interaction.reply({ content: `you need ${item.cost} coins but only have ${result.balance}.`, ephemeral: true });
+          return;
+        }
+
+        addItemToInventory(userId, itemId, 1);
+        db.exec('COMMIT');
+
+        const confirm = new EmbedBuilder()
+          .setTitle('✅ Purchase complete')
+          .setDescription(`${item.emoji} **${item.displayname}** purchased for **${item.cost}** coins.`)
+          .addFields({ name: 'balance', value: `${result.balance} coins`, inline: true })
+          .setColor(0x00cc66)
+          .setFooter({ text: `bought by ${username}` });
+
+        await interaction.reply({ embeds: [confirm], ephemeral: true });
+      } catch (err) {
+        console.error('Purchase transaction error:', err);
+        try { db.exec('ROLLBACK'); } catch (e2) {}
+        await interaction.reply({ content: 'could not complete purchase.', ephemeral: true });
       }
-
-      try { await addItemToInventory(userId, itemId, 1); } catch(e) { }
-
-      const confirm = new EmbedBuilder()
-        .setTitle('✅ Purchase complete')
-        .setDescription(`${item.emoji} **${item.displayname}** purchased for **${item.cost}** coins.`)
-        .addFields({ name: 'balance', value: `${result.balance} coins`, inline: true })
-        .setColor(0x00cc66)
-        .setFooter({ text: `bought by ${username}` });
-
-      await interaction.reply({ embeds: [confirm], ephemeral: true });
     } catch (err) {
       console.error('Purchase error:', err);
       await interaction.reply({ content: 'could not complete purchase.', ephemeral: true });
